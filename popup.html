@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TTS Settings</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Text-to-Speech</h1>
+
+    <div class="setting-group">
+      <label class="toggle-label">
+        <span>Enable Extension</span>
+        <div class="toggle-switch">
+          <input type="checkbox" id="enableToggle" checked>
+          <span class="slider"></span>
+        </div>
+      </label>
+    </div>
+
+    <div class="setting-group">
+      <label for="triggerKey">Trigger Key</label>
+      <div class="key-input-wrapper">
+        <input type="text" id="triggerKey" readonly placeholder="Press a key...">
+        <button id="recordKey" class="btn-small">Change</button>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <label for="voiceSelect">Voice</label>
+      <select id="voiceSelect">
+        <option value="">Default</option>
+      </select>
+    </div>
+
+    <div class="setting-group">
+      <label for="speedSlider">
+        Speed: <span id="speedValue">1.0x</span>
+      </label>
+      <input type="range" id="speedSlider" min="0.5" max="2" step="0.1" value="1">
+    </div>
+
+    <div class="setting-group">
+      <label for="pitchSlider">
+        Pitch: <span id="pitchValue">1.0</span>
+      </label>
+      <input type="range" id="pitchSlider" min="0.5" max="2" step="0.1" value="1">
+    </div>
+
+    <div class="button-group">
+      <button id="testButton" class="btn btn-secondary">Test Voice</button>
+      <button id="saveButton" class="btn btn-primary">Save Settings</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div class="pdf-note">
+      <strong>PDF Support:</strong> Select text and press <kbd id="shortcutKey">Ctrl+Shift+P</kbd> to read aloud (works everywhere, including PDFs).
+      <a href="#" id="shortcutLink">Customize shortcut</a>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
