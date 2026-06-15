@@ -1,5 +1,12 @@
 // Text-to-Speech Background Service Worker
-// Handles extension installation, default settings, and keyboard commands
+// Handles installation, default settings, and the speak-selection command.
+//
+// Normal pages: the live selection is read directly with chrome.scripting.
+// PDFs / restricted pages: Chrome's viewer keeps its selection inside a
+// sandboxed process we can't read, so the flow is "copy, then narrate" — the
+// user presses Cmd+C (their own trusted keystroke puts the text on the system
+// clipboard), then the shortcut reads the clipboard and speaks it. No debugger,
+// so no "debugging this browser" banner.
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -9,32 +16,6 @@ const DEFAULT_SETTINGS = {
   triggerKey: 'Space'
 };
 
-let isSpeaking = false;
-
-// Ensure offscreen document exists for clipboard access
-async function ensureOffscreenDocument() {
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [chrome.runtime.getURL('offscreen.html')]
-  });
-
-  if (existingContexts.length > 0) {
-    console.log('TTS: Offscreen document already exists');
-    return;
-  }
-
-  console.log('TTS: Creating offscreen document...');
-  await chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['CLIPBOARD'],
-    justification: 'Read clipboard for TTS'
-  });
-  console.log('TTS: Offscreen document created');
-
-  // Give it a moment to initialize
-  await new Promise(resolve => setTimeout(resolve, 100));
-}
-
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
@@ -42,210 +23,133 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
-// Handle keyboard command (Ctrl+Shift+S) - works on PDFs and all pages
+// ---------------------------------------------------------------------------
+// Offscreen document (clipboard read — service workers can't read it directly)
+// ---------------------------------------------------------------------------
+
+async function ensureOffscreenDocument() {
+  const existing = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [chrome.runtime.getURL('offscreen.html')]
+  });
+  if (existing.length > 0) return;
+
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['CLIPBOARD'],
+    justification: 'Read the clipboard to read copied text aloud'
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
+async function readClipboard(timeoutMs = 1500) {
+  await ensureOffscreenDocument();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(listener);
+      reject(new Error('clipboard read timeout'));
+    }, timeoutMs);
+
+    const listener = (message) => {
+      if (message && message.type === 'clipboardResult') {
+        clearTimeout(timeout);
+        chrome.runtime.onMessage.removeListener(listener);
+        if (message.error) reject(new Error(message.error));
+        else resolve(message.text || '');
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    chrome.runtime.sendMessage({ type: 'readClipboard', source: 'background' });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Speak-selection command
+// ---------------------------------------------------------------------------
+
+function ttsIsSpeaking() {
+  return new Promise((resolve) => chrome.tts.isSpeaking((speaking) => resolve(!!speaking)));
+}
+
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'speak-selection') return;
 
-  console.log('TTS: Command triggered');
-
-  // If speaking, stop
-  if (isSpeaking) {
+  // Toggle: stop if we're already reading.
+  if (await ttsIsSpeaking()) {
     chrome.tts.stop();
-    isSpeaking = false;
-    console.log('TTS: Stopped speaking');
     return;
   }
 
   try {
-    // Get the active tab
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
-      console.log('TTS: No active tab');
-      return;
-    }
+    if (!tab?.id) return;
+    console.log('TTS: command on', tab.url);
 
-    console.log('TTS: Active tab URL:', tab.url);
+    const { ttsSettings } = await chrome.storage.sync.get(['ttsSettings']);
+    const settings = { ...DEFAULT_SETTINGS, ...(ttsSettings || {}) };
+    if (!settings.enabled) return;
+
     let selectedText = '';
 
-    // Check if this is a restricted URL (chrome://, chrome-extension://)
-    const isRestrictedUrl = tab.url?.startsWith('chrome://') || tab.url?.startsWith('chrome-extension://');
-    const isPdfUrl = tab.url?.toLowerCase().includes('.pdf') || tab.url?.toLowerCase().includes('/pdf');
-
-    if (!isRestrictedUrl) {
-      // Try executeScript first (works on regular pages)
-      try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: tab.id, allFrames: true },
-          func: () => window.getSelection().toString().trim()
-        });
-
-        // Check all frames for selected text
-        for (const result of results) {
-          if (result.result) {
-            selectedText = result.result;
-            break;
-          }
-        }
-        console.log('TTS: executeScript result:', selectedText ? `"${selectedText.substring(0, 50)}..."` : '(empty)');
-      } catch (scriptError) {
-        console.log('TTS: executeScript failed:', scriptError.message);
+    // 1. Normal pages: read the live selection from every frame we can reach.
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        func: () => ((window.getSelection && window.getSelection().toString()) || '').trim()
+      });
+      for (const r of results) {
+        if (r.result) { selectedText = r.result; break; }
       }
-
-      // If no text and might be a PDF, try PDF postMessage API
-      if (!selectedText && isPdfUrl) {
-        console.log('TTS: PDF detected, trying postMessage API...');
-        try {
-          selectedText = await getPdfSelection(tab.id);
-          console.log('TTS: PDF postMessage result:', selectedText ? `"${selectedText.substring(0, 50)}..."` : '(empty)');
-        } catch (pdfError) {
-          console.error('TTS: PDF postMessage failed:', pdfError);
-        }
-      }
-    } else {
-      console.log('TTS: Restricted URL detected, using clipboard only');
+    } catch (_) {
+      // Injection blocked (PDF viewer / restricted page) — use the clipboard.
     }
 
-    // If no text yet, try clipboard (required for chrome-extension:// URLs, or as fallback)
+    // 2. PDF / restricted pages: narrate what the user copied with Cmd+C.
     if (!selectedText) {
-      console.log('TTS: Trying clipboard...');
       try {
         selectedText = await readClipboard();
-        console.log('TTS: Clipboard result:', selectedText ? `"${selectedText.substring(0, 50)}..."` : '(empty)');
-      } catch (clipError) {
-        console.error('TTS: Clipboard fallback failed:', clipError);
+        console.log('TTS: read clipboard —', selectedText ? `${selectedText.length} chars` : '(empty)');
+      } catch (e) {
+        console.error('TTS: clipboard read failed:', e.message);
       }
     }
 
     if (!selectedText) {
-      console.log('TTS: No text found');
+      console.log('TTS: nothing to read — select text and press Cmd+C first on PDFs');
       return;
     }
+    console.log(`TTS: speaking ${selectedText.length} chars`);
 
-    // Get current settings
-    const { ttsSettings } = await chrome.storage.sync.get(['ttsSettings']);
-    const settings = ttsSettings || DEFAULT_SETTINGS;
-
-    if (!settings.enabled) {
-      console.log('TTS: Extension disabled');
-      return;
-    }
-
-    // Build TTS options
     const ttsOptions = {
       rate: settings.speed || 1,
       pitch: settings.pitch || 1,
       onEvent: (event) => {
-        if (event.type === 'start') {
-          isSpeaking = true;
-        } else if (event.type === 'end' || event.type === 'error' || event.type === 'cancelled') {
-          isSpeaking = false;
-        }
+        if (event.type === 'error') console.error('TTS: speak error:', event.errorMessage);
       }
     };
 
-    // Add voice if specified
+    // Only request a specific voice if chrome.tts actually offers it — a stale
+    // name (e.g. a Web Speech / remote voice) would make speak() fail silently.
     if (settings.voiceName) {
-      ttsOptions.voiceName = settings.voiceName;
+      const voices = await new Promise((resolve) => chrome.tts.getVoices(resolve));
+      if (voices.some((v) => v.voiceName === settings.voiceName)) {
+        ttsOptions.voiceName = settings.voiceName;
+      } else {
+        console.warn(`TTS: voice "${settings.voiceName}" unavailable; using default`);
+      }
     }
 
-    // Speak the text
-    console.log('TTS: Speaking text...');
     chrome.tts.speak(selectedText, ttsOptions);
-
   } catch (error) {
     console.error('TTS: Command error:', error);
-    isSpeaking = false;
   }
 });
 
-// Get PDF selection using Chrome's undocumented postMessage API
-async function getPdfSelection(tabId) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error('PDF selection timeout'));
-    }, 2000);
+// ---------------------------------------------------------------------------
+// Settings messaging (popup)
+// ---------------------------------------------------------------------------
 
-    // Inject script to query PDF embed and relay response
-    chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: () => {
-        return new Promise((resolve) => {
-          const embed = document.querySelector('embed[type="application/pdf"]');
-          if (!embed) {
-            resolve('');
-            return;
-          }
-
-          const messageId = 'tts_' + Date.now();
-
-          const handler = (event) => {
-            if (event.data && event.data.type === 'getSelectedTextReply') {
-              window.removeEventListener('message', handler);
-              resolve(event.data.selectedText || '');
-            }
-          };
-
-          window.addEventListener('message', handler);
-
-          // Send request to PDF viewer
-          embed.postMessage({ type: 'getSelectedText' }, '*');
-
-          // Timeout fallback
-          setTimeout(() => {
-            window.removeEventListener('message', handler);
-            resolve('');
-          }, 1500);
-        });
-      }
-    }).then(results => {
-      clearTimeout(timeout);
-      const text = results?.[0]?.result || '';
-      resolve(text.trim());
-    }).catch(err => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
-}
-
-// Read clipboard using offscreen document (reliable in MV3)
-async function readClipboard() {
-  await ensureOffscreenDocument();
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      console.log('TTS: Clipboard read timed out');
-      chrome.runtime.onMessage.removeListener(listener);
-      reject(new Error('Clipboard read timeout'));
-    }, 3000);
-
-    const listener = (message) => {
-      if (message.type === 'clipboardResult') {
-        console.log('TTS: Received clipboardResult:', message);
-        clearTimeout(timeout);
-        chrome.runtime.onMessage.removeListener(listener);
-        if (message.error) {
-          reject(new Error(message.error));
-        } else {
-          resolve(message.text || '');
-        }
-      }
-    };
-
-    chrome.runtime.onMessage.addListener(listener);
-
-    console.log('TTS: Sending readClipboard message to offscreen...');
-    chrome.runtime.sendMessage({
-      type: 'readClipboard',
-      source: 'background'
-    });
-  });
-}
-
-// Handle messages from popup or content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Ignore clipboard messages (handled by offscreen.js)
   if (message.type === 'readClipboard' || message.type === 'clipboardResult') {
     return false;
   }

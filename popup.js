@@ -168,6 +168,10 @@ document.addEventListener('DOMContentLoaded', () => {
   if (shortcutKey) {
     shortcutKey.textContent = isMac ? '⌘+Shift+P' : 'Ctrl+Shift+P';
   }
+  const copyKey = document.getElementById('copyKey');
+  if (copyKey) {
+    copyKey.textContent = isMac ? '⌘+C' : 'Ctrl+C';
+  }
 
   // Handle shortcut customization link
   const shortcutLink = document.getElementById('shortcutLink');
