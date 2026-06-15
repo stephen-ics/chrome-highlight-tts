@@ -1,12 +1,11 @@
 // Text-to-Speech Background Service Worker
 // Handles installation, default settings, and the speak-selection command.
 //
-// On normal pages the live selection is read directly with chrome.scripting.
-// On PDFs, Chrome renders the document inside a sandboxed viewer frame that
-// content scripts cannot reach, so we copy the current selection via the
-// chrome.debugger API (synthesizing Cmd/Ctrl+C) and read it back from the
-// clipboard through an offscreen document. The user's clipboard is restored
-// afterwards so this stays invisible.
+// Normal pages: the live selection is read directly with chrome.scripting.
+// PDFs (Chrome's built-in viewer): the selection lives inside the viewer's
+// plugin, not the DOM, so we inject a script into the PDF's frame and ask the
+// viewer for its selection through its internal postMessage interface. No
+// debugger is used, so Chrome shows no "debugging this browser" banner.
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -16,11 +15,6 @@ const DEFAULT_SETTINGS = {
   triggerKey: 'Space'
 };
 
-const IS_MAC = navigator.userAgent.includes('Macintosh') || navigator.userAgent.includes('Mac OS');
-
-// Guards against overlapping debugger sessions on the same tab.
-let pdfCopyInProgress = false;
-
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
@@ -29,7 +23,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 // ---------------------------------------------------------------------------
-// Offscreen document (clipboard read/write)
+// Offscreen document (clipboard fallback for restricted pages)
 // ---------------------------------------------------------------------------
 
 async function ensureOffscreenDocument() {
@@ -42,52 +36,34 @@ async function ensureOffscreenDocument() {
   await chrome.offscreen.createDocument({
     url: 'offscreen.html',
     reasons: ['CLIPBOARD'],
-    justification: 'Read and restore the clipboard for text-to-speech'
+    justification: 'Read the clipboard for text-to-speech on restricted pages'
   });
-  // Give the document a moment to register its message listener.
   await new Promise((resolve) => setTimeout(resolve, 100));
 }
 
-// Send a request to the offscreen document and wait for its typed reply.
-async function clipboardRequest(type, payload, replyType, timeoutMs) {
+async function readClipboard(timeoutMs = 1500) {
   await ensureOffscreenDocument();
-
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.runtime.onMessage.removeListener(listener);
-      reject(new Error(type + ' timeout'));
+      reject(new Error('clipboard read timeout'));
     }, timeoutMs);
 
     const listener = (message) => {
-      if (message && message.type === replyType) {
+      if (message && message.type === 'clipboardResult') {
         clearTimeout(timeout);
         chrome.runtime.onMessage.removeListener(listener);
         if (message.error) reject(new Error(message.error));
-        else resolve(message);
+        else resolve(message.text || '');
       }
     };
-
     chrome.runtime.onMessage.addListener(listener);
-    chrome.runtime.sendMessage({ type, source: 'background', ...payload });
+    chrome.runtime.sendMessage({ type: 'readClipboard', source: 'background' });
   });
 }
 
-async function readClipboard(timeoutMs = 1500) {
-  const res = await clipboardRequest('readClipboard', {}, 'clipboardResult', timeoutMs);
-  return res.text || '';
-}
-
-async function writeClipboard(text, timeoutMs = 1500) {
-  try {
-    const res = await clipboardRequest('writeClipboard', { text }, 'clipboardWriteResult', timeoutMs);
-    return !!res.success;
-  } catch (e) {
-    return false;
-  }
-}
-
 // ---------------------------------------------------------------------------
-// PDF selection via the debugger API
+// PDF selection via the viewer's postMessage interface (no debugger)
 // ---------------------------------------------------------------------------
 
 function isPdfUrl(url) {
@@ -96,119 +72,83 @@ function isPdfUrl(url) {
   return base.endsWith('.pdf');
 }
 
-function canAttachDebugger(url) {
-  if (!url) return false;
-  const blocked = ['chrome://', 'chrome-extension://', 'edge://', 'devtools://', 'about:', 'view-source:'];
-  if (blocked.some((p) => url.startsWith(p))) return false;
-  if (url.startsWith('https://chrome.google.com/webstore') ||
-      url.startsWith('https://chromewebstore.google.com')) return false;
-  return true;
-}
-
-function debuggerSend(target, method, params) {
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand(target, method, params || {}, (result) => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(result);
-    });
-  });
-}
-
-function rawAttach(target) {
-  return new Promise((resolve, reject) => {
-    chrome.debugger.attach(target, '1.3', () => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve();
-    });
-  });
-}
-
-async function attachDebugger(target) {
-  try {
-    await rawAttach(target);
-  } catch (e) {
-    // A previous run (e.g. one cut short by the service worker shutting down)
-    // can leave its session attached. Clear it and try once more.
-    if (/already attached/i.test(e.message || '')) {
-      await detachDebugger(target);
-      await rawAttach(target);
-    } else {
-      throw e;
-    }
-  }
-}
-
-function detachDebugger(target) {
+// Injected into the page (MAIN world). For the frame that hosts Chrome's PDF
+// plugin, asks the viewer for the current selection and waits for its reply.
+// Returns a small diagnostics object so failures are debuggable.
+function pdfSelectionProbe() {
   return new Promise((resolve) => {
-    chrome.debugger.detach(target, () => {
-      void chrome.runtime.lastError; // ignore detach errors
-      resolve();
-    });
+    const out = {
+      href: location.href,
+      ct: document.contentType,
+      direct: '',
+      embedFound: false,
+      embedType: '',
+      gotReply: false,
+      text: ''
+    };
+
+    try { out.direct = ((window.getSelection && window.getSelection().toString()) || '').trim(); } catch (e) {}
+    if (out.direct) { out.text = out.direct; resolve(out); return; }
+
+    const embed = document.querySelector(
+      'embed[type="application/pdf"], embed[type="application/x-google-chrome-pdf"], embed[name="plugin"], embed'
+    );
+    if (!embed) { resolve(out); return; }
+    out.embedFound = true;
+    out.embedType = embed.getAttribute('type') || '';
+
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.removeEventListener('message', handler);
+      resolve(out);
+    };
+
+    const handler = (event) => {
+      const d = event.data;
+      if (d && (d.type === 'getSelectedTextReply' || d.type === 'getSelectionReply')) {
+        out.gotReply = true;
+        out.text = ((d.selectedText != null ? d.selectedText : d.selection) || '').trim();
+        finish();
+      }
+    };
+    window.addEventListener('message', handler);
+
+    // The PDF MimeHandlerView <embed> exposes a postMessage method; also try
+    // its contentWindow as a fallback for other frame arrangements.
+    try { if (typeof embed.postMessage === 'function') embed.postMessage({ type: 'getSelectedText' }, '*'); } catch (e) {}
+    try { if (embed.contentWindow) embed.contentWindow.postMessage({ type: 'getSelectedText' }, '*'); } catch (e) {}
+
+    setTimeout(finish, 800);
   });
 }
 
-// Synthesize the platform copy shortcut (Cmd+C on mac, Ctrl+C elsewhere).
-async function dispatchCopyShortcut(target) {
-  const mod = IS_MAC ? 4 /* Meta */ : 2 /* Ctrl */;
-  const modKey = IS_MAC
-    ? { key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91, nativeVirtualKeyCode: 91 }
-    : { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 };
-  const cKey = { key: 'c', code: 'KeyC', windowsVirtualKeyCode: 67, nativeVirtualKeyCode: 67 };
-
-  await debuggerSend(target, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: mod, ...modKey });
-  await debuggerSend(target, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: mod, ...cKey });
-  await debuggerSend(target, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mod, ...cKey });
-  await debuggerSend(target, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 0, ...modKey });
-}
-
-// Copy the current PDF selection to the clipboard, read it, then restore the
-// user's previous clipboard contents. Returns the selected text (or '').
-async function copyPdfSelectionViaDebugger(tabId) {
-  // Ignore a second trigger while a copy is still running — otherwise it would
-  // try to attach a debugger to a tab that already has ours attached.
-  if (pdfCopyInProgress) {
-    console.log('TTS: copy already in progress, ignoring');
+async function getPdfSelection(tabId) {
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: pdfSelectionProbe
+    });
+  } catch (e) {
+    console.error('TTS: PDF probe injection failed:', e.message,
+      '\nFor local file:// PDFs, enable "Allow access to file URLs" for this extension at chrome://extensions.');
     return '';
   }
-  pdfCopyInProgress = true;
 
-  const target = { tabId };
-  const sentinel = '__TTS_SENTINEL__' + Date.now() + '__';
-
-  let original = '';
-  try { original = await readClipboard(); } catch (_) { original = ''; }
-
-  let attached = false;
-  try {
-    await attachDebugger(target);
-    attached = true;
-    console.log('TTS: debugger attached to tab', tabId);
-
-    // Mark the clipboard so we can tell whether the copy actually landed,
-    // even if the selection happens to equal the previous clipboard text.
-    const sentinelWritten = await writeClipboard(sentinel);
-    const baseline = sentinelWritten ? sentinel : original;
-
-    await dispatchCopyShortcut(target);
-
-    // The copy completes asynchronously; poll until the clipboard changes.
-    let copied = '';
-    for (let i = 0; i < 10; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      let clip = '';
-      try { clip = await readClipboard(); } catch (_) { clip = ''; }
-      if (clip && clip !== baseline) { copied = clip; break; }
-    }
-
-    console.log('TTS: PDF copy result —',
-      copied ? `${copied.length} chars: "${copied.slice(0, 50)}..."` : '(nothing copied)');
-    return copied.trim();
-  } finally {
-    if (attached) await detachDebugger(target);
-    // Best-effort restore of the user's original clipboard.
-    await writeClipboard(original).catch(() => {});
-    pdfCopyInProgress = false;
+  for (const r of results) {
+    const v = r.result || {};
+    console.log('TTS: PDF frame —', {
+      href: v.href, contentType: v.ct, embedFound: v.embedFound,
+      embedType: v.embedType, gotReply: v.gotReply, textLen: (v.text || '').length
+    });
   }
+  for (const r of results) {
+    if (r.result && r.result.text) return r.result.text.trim();
+  }
+  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +179,6 @@ chrome.commands.onCommand.addListener(async (command) => {
 
     let selectedText = '';
     let looksLikePdf = isPdfUrl(tab.url);
-    let execThrew = false;
 
     // 1. Regular pages: read the live selection from every frame we can reach.
     try {
@@ -255,20 +194,12 @@ chrome.commands.onCommand.addListener(async (command) => {
         if (r.result?.ct === 'application/pdf') looksLikePdf = true;
       }
     } catch (_) {
-      // Injection blocked (the PDF viewer, or a file:// page without file
-      // access) — treat that as a strong hint to try the debugger path below.
-      execThrew = true;
+      // Injection blocked — likely the PDF viewer; handled below.
     }
 
-    // 2. PDF: copy the selection through the debugger, then read it back.
-    const tryDebugger = !selectedText && canAttachDebugger(tab.url) &&
-      (looksLikePdf || (execThrew && (tab.url || '').startsWith('file://')));
-    if (tryDebugger) {
-      try {
-        selectedText = await copyPdfSelectionViaDebugger(tab.id);
-      } catch (e) {
-        console.error('TTS: PDF copy failed:', e);
-      }
+    // 2. PDF: ask the viewer for its selection via postMessage (no debugger).
+    if (!selectedText && looksLikePdf) {
+      selectedText = await getPdfSelection(tab.id);
     }
 
     // 3. Restricted non-PDF pages: fall back to whatever the user has copied.
@@ -277,7 +208,7 @@ chrome.commands.onCommand.addListener(async (command) => {
     }
 
     if (!selectedText) {
-      console.log('TTS: no text to read (selection empty / copy failed)');
+      console.log('TTS: no text to read (selection empty / viewer did not reply)');
       return;
     }
     console.log(`TTS: speaking ${selectedText.length} chars`);
@@ -312,7 +243,6 @@ chrome.commands.onCommand.addListener(async (command) => {
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Clipboard traffic is handled by the offscreen document / clipboardRequest.
   if (message.type === 'readClipboard' || message.type === 'clipboardResult' ||
       message.type === 'writeClipboard' || message.type === 'clipboardWriteResult') {
     return false;
