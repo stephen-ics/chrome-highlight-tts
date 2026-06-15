@@ -18,6 +18,9 @@ const DEFAULT_SETTINGS = {
 
 const IS_MAC = navigator.userAgent.includes('Macintosh') || navigator.userAgent.includes('Mac OS');
 
+// Guards against overlapping debugger sessions on the same tab.
+let pdfCopyInProgress = false;
+
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
@@ -111,13 +114,28 @@ function debuggerSend(target, method, params) {
   });
 }
 
-function attachDebugger(target) {
+function rawAttach(target) {
   return new Promise((resolve, reject) => {
     chrome.debugger.attach(target, '1.3', () => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve();
     });
   });
+}
+
+async function attachDebugger(target) {
+  try {
+    await rawAttach(target);
+  } catch (e) {
+    // A previous run (e.g. one cut short by the service worker shutting down)
+    // can leave its session attached. Clear it and try once more.
+    if (/already attached/i.test(e.message || '')) {
+      await detachDebugger(target);
+      await rawAttach(target);
+    } else {
+      throw e;
+    }
+  }
 }
 
 function detachDebugger(target) {
@@ -146,6 +164,14 @@ async function dispatchCopyShortcut(target) {
 // Copy the current PDF selection to the clipboard, read it, then restore the
 // user's previous clipboard contents. Returns the selected text (or '').
 async function copyPdfSelectionViaDebugger(tabId) {
+  // Ignore a second trigger while a copy is still running — otherwise it would
+  // try to attach a debugger to a tab that already has ours attached.
+  if (pdfCopyInProgress) {
+    console.log('TTS: copy already in progress, ignoring');
+    return '';
+  }
+  pdfCopyInProgress = true;
+
   const target = { tabId };
   const sentinel = '__TTS_SENTINEL__' + Date.now() + '__';
 
@@ -167,8 +193,8 @@ async function copyPdfSelectionViaDebugger(tabId) {
 
     // The copy completes asynchronously; poll until the clipboard changes.
     let copied = '';
-    for (let i = 0; i < 12; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 60));
+    for (let i = 0; i < 10; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
       let clip = '';
       try { clip = await readClipboard(); } catch (_) { clip = ''; }
       if (clip && clip !== baseline) { copied = clip; break; }
@@ -181,6 +207,7 @@ async function copyPdfSelectionViaDebugger(tabId) {
     if (attached) await detachDebugger(target);
     // Best-effort restore of the user's original clipboard.
     await writeClipboard(original).catch(() => {});
+    pdfCopyInProgress = false;
   }
 }
 
