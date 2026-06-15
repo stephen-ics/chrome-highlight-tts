@@ -2,10 +2,11 @@
 // Handles installation, default settings, and the speak-selection command.
 //
 // Normal pages: the live selection is read directly with chrome.scripting.
-// PDFs (Chrome's built-in viewer): the selection lives inside the viewer's
-// plugin, not the DOM, so we inject a script into the PDF's frame and ask the
-// viewer for its selection through its internal postMessage interface. No
-// debugger is used, so Chrome shows no "debugging this browser" banner.
+// PDFs / restricted pages: Chrome's viewer keeps its selection inside a
+// sandboxed process we can't read, so the flow is "copy, then narrate" — the
+// user presses Cmd+C (their own trusted keystroke puts the text on the system
+// clipboard), then the shortcut reads the clipboard and speaks it. No debugger,
+// so no "debugging this browser" banner.
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -23,7 +24,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 // ---------------------------------------------------------------------------
-// Offscreen document (clipboard fallback for restricted pages)
+// Offscreen document (clipboard read — service workers can't read it directly)
 // ---------------------------------------------------------------------------
 
 async function ensureOffscreenDocument() {
@@ -36,7 +37,7 @@ async function ensureOffscreenDocument() {
   await chrome.offscreen.createDocument({
     url: 'offscreen.html',
     reasons: ['CLIPBOARD'],
-    justification: 'Read the clipboard for text-to-speech on restricted pages'
+    justification: 'Read the clipboard to read copied text aloud'
   });
   await new Promise((resolve) => setTimeout(resolve, 100));
 }
@@ -60,95 +61,6 @@ async function readClipboard(timeoutMs = 1500) {
     chrome.runtime.onMessage.addListener(listener);
     chrome.runtime.sendMessage({ type: 'readClipboard', source: 'background' });
   });
-}
-
-// ---------------------------------------------------------------------------
-// PDF selection via the viewer's postMessage interface (no debugger)
-// ---------------------------------------------------------------------------
-
-function isPdfUrl(url) {
-  if (!url) return false;
-  const base = url.toLowerCase().split('#')[0].split('?')[0];
-  return base.endsWith('.pdf');
-}
-
-// Injected into the page (MAIN world). For the frame that hosts Chrome's PDF
-// plugin, asks the viewer for the current selection and waits for its reply.
-// Returns a small diagnostics object so failures are debuggable.
-function pdfSelectionProbe() {
-  return new Promise((resolve) => {
-    const out = {
-      href: location.href,
-      ct: document.contentType,
-      direct: '',
-      embedFound: false,
-      embedType: '',
-      gotReply: false,
-      text: ''
-    };
-
-    try { out.direct = ((window.getSelection && window.getSelection().toString()) || '').trim(); } catch (e) {}
-    if (out.direct) { out.text = out.direct; resolve(out); return; }
-
-    const embed = document.querySelector(
-      'embed[type="application/pdf"], embed[type="application/x-google-chrome-pdf"], embed[name="plugin"], embed'
-    );
-    if (!embed) { resolve(out); return; }
-    out.embedFound = true;
-    out.embedType = embed.getAttribute('type') || '';
-
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      window.removeEventListener('message', handler);
-      resolve(out);
-    };
-
-    const handler = (event) => {
-      const d = event.data;
-      if (d && (d.type === 'getSelectedTextReply' || d.type === 'getSelectionReply')) {
-        out.gotReply = true;
-        out.text = ((d.selectedText != null ? d.selectedText : d.selection) || '').trim();
-        finish();
-      }
-    };
-    window.addEventListener('message', handler);
-
-    // The PDF MimeHandlerView <embed> exposes a postMessage method; also try
-    // its contentWindow as a fallback for other frame arrangements.
-    try { if (typeof embed.postMessage === 'function') embed.postMessage({ type: 'getSelectedText' }, '*'); } catch (e) {}
-    try { if (embed.contentWindow) embed.contentWindow.postMessage({ type: 'getSelectedText' }, '*'); } catch (e) {}
-
-    setTimeout(finish, 800);
-  });
-}
-
-async function getPdfSelection(tabId) {
-  let results;
-  try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: 'MAIN',
-      func: pdfSelectionProbe
-    });
-  } catch (e) {
-    console.error('TTS: PDF probe injection failed:', e.message,
-      '\nFor local file:// PDFs, enable "Allow access to file URLs" for this extension at chrome://extensions.');
-    return '';
-  }
-
-  for (const r of results) {
-    const v = r.result || {};
-    console.log('TTS: PDF frame —', {
-      href: v.href, contentType: v.ct, embedFound: v.embedFound,
-      embedType: v.embedType, gotReply: v.gotReply, textLen: (v.text || '').length
-    });
-  }
-  for (const r of results) {
-    if (r.result && r.result.text) return r.result.text.trim();
-  }
-  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -178,37 +90,32 @@ chrome.commands.onCommand.addListener(async (command) => {
     if (!settings.enabled) return;
 
     let selectedText = '';
-    let looksLikePdf = isPdfUrl(tab.url);
 
-    // 1. Regular pages: read the live selection from every frame we can reach.
+    // 1. Normal pages: read the live selection from every frame we can reach.
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: true },
-        func: () => ({
-          sel: ((window.getSelection && window.getSelection().toString()) || '').trim(),
-          ct: document.contentType
-        })
+        func: () => ((window.getSelection && window.getSelection().toString()) || '').trim()
       });
       for (const r of results) {
-        if (r.result?.sel) { selectedText = r.result.sel; break; }
-        if (r.result?.ct === 'application/pdf') looksLikePdf = true;
+        if (r.result) { selectedText = r.result; break; }
       }
     } catch (_) {
-      // Injection blocked — likely the PDF viewer; handled below.
+      // Injection blocked (PDF viewer / restricted page) — use the clipboard.
     }
 
-    // 2. PDF: ask the viewer for its selection via postMessage (no debugger).
-    if (!selectedText && looksLikePdf) {
-      selectedText = await getPdfSelection(tab.id);
-    }
-
-    // 3. Restricted non-PDF pages: fall back to whatever the user has copied.
-    if (!selectedText && !looksLikePdf) {
-      try { selectedText = await readClipboard(); } catch (_) {}
+    // 2. PDF / restricted pages: narrate what the user copied with Cmd+C.
+    if (!selectedText) {
+      try {
+        selectedText = await readClipboard();
+        console.log('TTS: read clipboard —', selectedText ? `${selectedText.length} chars` : '(empty)');
+      } catch (e) {
+        console.error('TTS: clipboard read failed:', e.message);
+      }
     }
 
     if (!selectedText) {
-      console.log('TTS: no text to read (selection empty / viewer did not reply)');
+      console.log('TTS: nothing to read — select text and press Cmd+C first on PDFs');
       return;
     }
     console.log(`TTS: speaking ${selectedText.length} chars`);
@@ -243,8 +150,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'readClipboard' || message.type === 'clipboardResult' ||
-      message.type === 'writeClipboard' || message.type === 'clipboardWriteResult') {
+  if (message.type === 'readClipboard' || message.type === 'clipboardResult') {
     return false;
   }
 
