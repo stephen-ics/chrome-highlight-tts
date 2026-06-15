@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Text-to-Speech Reader",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Read selected text aloud by pressing the space key",
   "permissions": ["activeTab", "storage", "scripting", "tts", "clipboardRead", "offscreen", "debugger"],
   "commands": {
